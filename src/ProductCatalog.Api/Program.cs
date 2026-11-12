@@ -31,7 +31,7 @@ db.Database.EnsureCreated();
 app.MapGet("/health", () => Results.Ok(new { status = "Healthy",
 timestamp = DateTime.UtcNow }))
 .WithName("HealthCheck");
-// 2. Endpoints (listing des produits et ajout d’un produit)
+// 2. Endpoints (listing des produits et ajout d'un produit)
 app.MapGet("/api/products", async (AppDbContext db) =>
 await db.Products.AsNoTracking().ToListAsync())
 .WithName("GetAllProducts");
@@ -42,8 +42,23 @@ db.Products.Add(product);
 await db.SaveChangesAsync();
 return Results.Created($"/api/products/{product.Id}", product);
 }).WithName("CreateProduct");
+// 3. GetProductById (Partie 3)
+app.MapGet("/api/get-product/{id:int}", async (int id, AppDbContext db) =>
+{
+    var product = await db.Products.AsNoTracking()
+        .FirstOrDefaultAsync(p => p.Id == id);
+
+    if (product is null)
+    {
+        return Results.NotFound(new
+        {
+            message = $"Aucun produit trouvé avec l'identifiant {id}."
+        });
+    }
+    return Results.Ok(product);
+})
+.WithName("GetProductById");
 app.UseHttpsRedirection();
 
 
 app.Run();
-
