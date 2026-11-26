@@ -1,0 +1,168 @@
+name: CI/CD Pipeline - ProductCatalog API
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  # ====================================================================
+  # JOB 1 : Continuous Integration (Build & Unit Tests)
+  # ====================================================================
+  unit-tests:
+    name: Build & Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Extraction du code source du dépôt
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # 2. Configuration du SDK .NET
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      # 3. Restauration des dépendances NuGet de la solution
+      - name: Restore dependencies
+        run: dotnet restore src/ProductCatalog.Api/ProductCatalog.Api.csproj
+
+      # 4. Compilation de la solution en mode Release sans re-restaurer
+      - name: Build solution
+        run: dotnet build src/ProductCatalog.Api/ProductCatalog.Api.csproj --configuration Release --no-restore
+
+      - name: Run Unit Tests
+        run: >
+          dotnet test tests/ProductCatalog.Tests/ProductCatalog.Tests.csproj
+          --filter "FullyQualifiedName~ProductUnitTests"
+          --configuration Release
+          --logger "console;verbosity=detailed"
+          --logger "trx;LogFileName=UnitResults.trx"
+          --results-directory ./TestResults/UnitTests
+
+      - name: Upload Unit Tests Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-test-results
+          path: ./TestResults/UnitTests/*.trx
+
+      - name: Publish Test Summary
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: 'Report - Unit Tests'
+          path: './TestResults/UnitTests/*.trx'
+          reporter: 'dotnet-trx'
+
+  # ====================================================================
+  # JOB 2 : Tests d'Intégration avec Service SQL Server
+  # ====================================================================
+  integration-test:
+    name: Integration Tests (SQL Server)
+    runs-on: ubuntu-latest
+    needs: [unit-tests] # Condition : ne s'exécute QUE si le 1er Job a réussi !
+
+    # Le conteneur Docker n'est instancié QUE pour ce job
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        ports:
+          - 1433:1433
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: "Password123!"
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Password123!' -C -Q 'SELECT 1'"
+          --health-interval 15s
+          --health-timeout 5s
+          --health-retries 6
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore tests/ProductCatalog.Tests/ProductCatalog.Tests.csproj
+
+      - name: Build solution
+        run: dotnet build tests/ProductCatalog.Tests/ProductCatalog.Tests.csproj --configuration Release --no-restore
+
+      - name: Run Integration Tests
+        env:
+          ConnectionStrings__CatalogDbConnection: "Server=localhost,1433;Database=CatalogDB_Test;User Id=sa;Password=Password123!;TrustServerCertificate=True;MultipleActiveResultSets=true"
+        run: >
+          dotnet test tests/ProductCatalog.Tests/ProductCatalog.Tests.csproj
+          --filter "FullyQualifiedName~ProductIntegrationTests"
+          --no-build
+          --configuration Release
+          --logger "console;verbosity=detailed"
+          --logger "trx;LogFileName=IntegrationResults.trx"
+          --results-directory ./TestResults/IntegrationTests
+
+      - name: Upload Integration Tests TRX
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-test-results
+          path: ./TestResults/IntegrationTests/*.trx
+
+      - name: Publish Test Summary
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: 'Report - Integration Tests'
+          path: './TestResults/IntegrationTests/*.trx'
+          reporter: 'dotnet-trx'
+
+  # ====================================================================
+  # JOB 3 : Continuous Delivery (Docker Build & Push vers Docker Hub)
+  # ====================================================================
+  build-and-push-docker:
+    name: Build & Push Docker Image
+    needs: [integration-test]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Récupérer le code source
+        uses: actions/checkout@v4
+
+      - name: Configurer Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Connexion au registre Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extraire les métadonnées (Tags et Labels sémantiques)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/productcatalog-api
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+            type=ref,event=branch
+
+      - name: Construire et publier l'image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
